@@ -1,6 +1,11 @@
 # filename: SystemAudit.ps1
 Set-StrictMode -Version Latest
 
+# КОНСОЛЬ в UTF8 на весь сеанс (PowerShell 5+)
+$oldConsoleEnc = [Console]::OutputEncoding
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($true)
+$PSDefaultParameterValues['*:Encoding'] = 'utf8'
+
 $timestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
 $desktop   = [Environment]::GetFolderPath('Desktop')
 $Report    = Join-Path -Path $desktop -ChildPath "SystemAudit_$timestamp.txt"
@@ -14,6 +19,7 @@ function Append-Report {
 function Append-CommandOutput {
     param([Parameter(Mandatory=$true)][ScriptBlock]$Command, [int]$Width = 500)
     try {
+        # Если командлет PowerShell — просто выводим
         $result = & $Command | Out-String -Width $Width
         Append-Report ($result.TrimEnd())
     } catch {
@@ -21,20 +27,16 @@ function Append-CommandOutput {
     }
 }
 
-# Внешние консольные утилиты часто печатают в OEM CP (866/1251). Конвертируем к UTF-8.
+# Внешние команды явно переводим в UTF-8 через chcp 65001
 function Invoke-ExternalUtf8 {
     param([Parameter(Mandatory=$true)][string]$CommandLine, [int]$Width = 500)
-    # Сохраняем текущую кодовую страницу (строка вида "Active code page: 866")
     $oldCp = chcp
     try {
-        # Переключаем на UTF-8
         $output = cmd /c "chcp 65001 > nul & $CommandLine"
-        # Собираем в строку и возвращаем
         return ($output | Out-String -Width $Width).TrimEnd()
     } catch {
         return ("ERROR: {0}" -f $_.Exception.Message)
     } finally {
-        # Возврат прежней CP
         $match = ($oldCp | Select-String -Pattern '\d+')
         if ($match) {
             $cp = $match.Matches[0].Value
@@ -42,6 +44,8 @@ function Invoke-ExternalUtf8 {
         }
     }
 }
+
+# --- Блок отчёта (без изменений) ---
 
 Write-Host "Step 1: System Information..."
 Append-Report "=== System Information ==="
@@ -68,7 +72,6 @@ Write-Host "Step 6: Startup Programs..."
 Append-Report "`n=== Startup Programs (Autostart) ==="
 function Get-StartupItems {
     $items = @()
-
     foreach ($root in @('HKLM:\Software\Microsoft\Windows\CurrentVersion\Run','HKCU:\Software\Microsoft\Windows\CurrentVersion\Run')) {
         if (Test-Path $root) {
             $props = Get-ItemProperty -Path $root
@@ -82,7 +85,6 @@ function Get-StartupItems {
             }
         }
     }
-
     $startupPaths = @(
         "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup",
         "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup"
@@ -98,7 +100,6 @@ function Get-StartupItems {
             }
         }
     }
-
     try {
         $logonTasks = Get-ScheduledTask | Where-Object { $_.Triggers | Where-Object { $_.TriggerType -eq 'Logon' } }
         foreach ($t in $logonTasks) {
@@ -112,7 +113,6 @@ function Get-StartupItems {
             }
         }
     } catch {}
-
     $items | Sort-Object Caption
 }
 Append-CommandOutput { Get-StartupItems | Format-Table Source, Caption, Command -AutoSize }
@@ -133,7 +133,6 @@ Append-CommandOutput {
 
 Write-Host "Step 8: System File Integrity (SFC)... (may take a while)"
 Append-Report "`n=== Integrity Check of System Files (SFC) ==="
-# Важно: запускать PowerShell с правами администратора
 $sfcOut = Invoke-ExternalUtf8 "sfc /scannow"
 Append-Report $sfcOut
 
@@ -163,7 +162,11 @@ Append-CommandOutput {
             @{n='Free(GB)';e={[math]::Round(($_.Free/1GB),2)}},
             @{n='Total(GB)';e={[math]::Round((($_.Used + $_.Free)/1GB),2)}}
 }
-
 Write-Host ""
 Write-Host "Script completed! Report saved: $Report"
 Append-Report "`nScript completed at $(Get-Date). Report saved: $Report"
+
+# ВОССТАНОВИТЬ КОДИРОВКУ КОНСОЛИ
+[Console]::OutputEncoding = $oldConsoleEnc
+
+# Нифига не работает как надо! я задолбался. Рядом есть вторая версия скрипта из 10 строк.
