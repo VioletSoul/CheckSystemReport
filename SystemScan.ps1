@@ -1,40 +1,45 @@
 # filename: SystemAudit.ps1
-
-# Включаем строгий режим
 Set-StrictMode -Version Latest
 
-# 1) Путь и создание файла отчёта (UTF-8 без BOM)
 $timestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
-$desktop = [Environment]::GetFolderPath('Desktop')
-$Report = Join-Path -Path $desktop -ChildPath "SystemAudit_$timestamp.txt"
-
-# Создаём пустой файл в UTF-8 (без BOM)
-# Set-Content создаёт файл заново с нужной кодировкой
+$desktop   = [Environment]::GetFolderPath('Desktop')
+$Report    = Join-Path -Path $desktop -ChildPath "SystemAudit_$timestamp.txt"
 Set-Content -Path $Report -Value "" -Encoding UTF8
 
-# Утилита для безопасного добавления текста в отчёт
 function Append-Report {
-    param(
-        [Parameter(Mandatory=$true)][string]$Text
-    )
+    param([Parameter(Mandatory=$true)][string]$Text)
     Add-Content -Path $Report -Value $Text -Encoding UTF8
 }
 
-# Утилита: выполнить команду, собрать строковый вывод и добавить в отчёт
 function Append-CommandOutput {
-    param(
-        [Parameter(Mandatory=$true)][ScriptBlock]$Command,
-        [int]$Width = 500
-    )
+    param([Parameter(Mandatory=$true)][ScriptBlock]$Command, [int]$Width = 500)
     try {
         $result = & $Command | Out-String -Width $Width
-        if ([string]::IsNullOrWhiteSpace($result)) {
-            Append-Report "No data."
-        } else {
-            Append-Report $result.TrimEnd()
-        }
+        Append-Report ($result.TrimEnd())
     } catch {
-        Append-Report "ERROR: $($_.Exception.Message)"
+        Append-Report ("ERROR: {0}" -f $_.Exception.Message)
+    }
+}
+
+# Внешние консольные утилиты часто печатают в OEM CP (866/1251). Конвертируем к UTF-8.
+function Invoke-ExternalUtf8 {
+    param([Parameter(Mandatory=$true)][string]$CommandLine, [int]$Width = 500)
+    # Сохраняем текущую кодовую страницу (строка вида "Active code page: 866")
+    $oldCp = chcp
+    try {
+        # Переключаем на UTF-8
+        $output = cmd /c "chcp 65001 > nul & $CommandLine"
+        # Собираем в строку и возвращаем
+        return ($output | Out-String -Width $Width).TrimEnd()
+    } catch {
+        return ("ERROR: {0}" -f $_.Exception.Message)
+    } finally {
+        # Возврат прежней CP
+        $match = ($oldCp | Select-String -Pattern '\d+')
+        if ($match) {
+            $cp = $match.Matches[0].Value
+            cmd /c "chcp $cp > nul" | Out-Null
+        }
     }
 }
 
@@ -44,7 +49,6 @@ Append-CommandOutput { systeminfo }
 
 Write-Host "Step 2: Network Configuration..."
 Append-Report "`n=== Network Configuration ==="
-# Используем Select-Object вместо Format-Table для полного захвата данных
 Append-CommandOutput { Get-NetIPConfiguration | Select-Object InterfaceAlias, IPv4Address, IPv4DefaultGateway, DnsServer }
 
 Write-Host "Step 3: Active Routes..."
@@ -57,16 +61,14 @@ Append-CommandOutput { Get-DnsClientServerAddress | Select-Object InterfaceAlias
 
 Write-Host "Step 5: Active Network Connections..."
 Append-Report "`n=== Active Network Connections (ESTABLISHED) ==="
-# netstat вывод — внешний; приведём к строке
-Append-CommandOutput { cmd /c 'netstat -ano | findstr ESTABLISHED' }
+$netstatOut = Invoke-ExternalUtf8 "netstat -ano | findstr ESTABLISHED"
+Append-Report $netstatOut
 
 Write-Host "Step 6: Startup Programs..."
 Append-Report "`n=== Startup Programs (Autostart) ==="
-# wmic устарел. Используем CIM-классы и реестры "Run" + папки Startup
 function Get-StartupItems {
     $items = @()
 
-    # 6a) Реестр: HKLM\Software\Microsoft\Windows\CurrentVersion\Run
     foreach ($root in @('HKLM:\Software\Microsoft\Windows\CurrentVersion\Run','HKCU:\Software\Microsoft\Windows\CurrentVersion\Run')) {
         if (Test-Path $root) {
             $props = Get-ItemProperty -Path $root
@@ -81,7 +83,6 @@ function Get-StartupItems {
         }
     }
 
-    # 6b) Папки Startup
     $startupPaths = @(
         "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup",
         "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup"
@@ -98,15 +99,11 @@ function Get-StartupItems {
         }
     }
 
-    # 6c) Планировщик (автозапуск при входе)
     try {
-        $logonTasks = Get-ScheduledTask | Where-Object {
-            $_.Triggers | Where-Object { $_.TriggerType -eq 'Logon' }
-        }
+        $logonTasks = Get-ScheduledTask | Where-Object { $_.Triggers | Where-Object { $_.TriggerType -eq 'Logon' } }
         foreach ($t in $logonTasks) {
-            $act = (Get-ScheduledTaskInfo -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction SilentlyContinue)
             $actions = $t.Actions | ForEach-Object {
-                if ($_ -is [Microsoft.PowerShell.ScheduledJob.ScheduledJobDefinition]) { $_.Command } else { $_.Execute }
+                if ($_.PSObject.Properties.Match('Execute').Count -gt 0) { $_.Execute } else { $_.Command }
             }
             $items += [pscustomobject]@{
                 Source   = "ScheduledTask"
@@ -114,16 +111,14 @@ function Get-StartupItems {
                 Command  = ($actions -join '; ')
             }
         }
-    } catch { }
+    } catch {}
 
     $items | Sort-Object Caption
 }
-
 Append-CommandOutput { Get-StartupItems | Format-Table Source, Caption, Command -AutoSize }
 
 Write-Host "Step 7: Non-standard Running Services..."
 Append-Report "`n=== Non-standard Running Services (Auto-start) ==="
-# Используем Get-CimInstance вместо Get-WmiObject
 Append-CommandOutput {
     $exclude = 'Microsoft|Windows|ASUS|Gigabyte|Realtek|Intel|AdGuard|UPSMON|NVIDIA|Armoury|Docker|Steam|SecurityHealth'
     Get-CimInstance -ClassName Win32_Service |
@@ -138,8 +133,9 @@ Append-CommandOutput {
 
 Write-Host "Step 8: System File Integrity (SFC)... (may take a while)"
 Append-Report "`n=== Integrity Check of System Files (SFC) ==="
-# sfc требует запуск в административной PowerShell для полноценной проверки
-Append-CommandOutput { sfc /scannow }
+# Важно: запускать PowerShell с правами администратора
+$sfcOut = Invoke-ExternalUtf8 "sfc /scannow"
+Append-Report $sfcOut
 
 Write-Host "Step 9: Windows Defender Status..."
 Append-Report "`n=== Windows Defender Status ==="
