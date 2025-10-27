@@ -1,45 +1,35 @@
-# === Проверка состояния Windows и сети ===
-$Report = "$env:USERPROFILE\Desktop\SystemAudit_$(Get-Date -Format 'yyyy-MM-dd_HH-mm').txt"
+# === Автоматическая диагностика системы ===
+$Report = "$env:USERPROFILE\Desktop\CheckSystemReport_$(Get-Date -Format 'yyyy-MM-dd_HH-mm').txt"
+Start-Transcript -Path $Report
 
-# Проверка версии системы
-Add-Content $Report "=== Сведения о системе ==="
-systeminfo | Out-String | Add-Content $Report
+Write-Host "`n==== Проверка сети ===="
+Get-NetIPConfiguration | Format-Table InterfaceAlias, IPv4Address, IPv4DefaultGateway, DnsServer
 
-# Проверка активных маршрутов
-Add-Content $Report "`n=== Активные маршруты ==="
-Get-NetRoute -AddressFamily IPv4 | Out-String | Add-Content $Report
+Write-Host "`n==== Проверка маршрутов ===="
+Get-NetRoute -AddressFamily IPv4 | Where-Object DestinationPrefix -eq "0.0.0.0/0" | Format-Table ifIndex, DestinationPrefix, NextHop
 
-# Проверка DNS-серверов
-Add-Content $Report "`n=== DNS-серверы ==="
-Get-DnsClientServerAddress | Out-String | Add-Content $Report
+Write-Host "`n==== Проверка DNS ===="
+Get-DnsClientServerAddress | Format-Table InterfaceAlias, ServerAddresses -AutoSize
 
-# Проверка автозагрузки
-Add-Content $Report "`n=== Автозагрузка ==="
-wmic startup get caption,command | Out-String | Add-Content $Report
+Write-Host "`n==== Проверка активных соединений ===="
+netstat -ano | findstr "ESTABLISHED"
 
-# Проверка служб, не относящихся к Microsoft и основным вендорам
-Add-Content $Report "`n=== Нестандартные службы ==="
+Write-Host "`n==== Проверка автозагрузки ===="
+wmic startup get caption,command | sort
+
+Write-Host "`n==== Проверка нестандартных служб ===="
 Get-WmiObject win32_service |
         Where-Object {
             $_.State -eq 'Running' -and
                     $_.StartMode -eq 'Auto' -and
-                    ($_.PathName -notmatch 'Microsoft|Windows|ASUS|Gigabyte|Realtek|NVIDIA|Docker|Intel|AdGuard|UPSMON|Armoury')
-        } |
-        Select-Object Name, DisplayName, PathName, StartMode, State |
-        Out-String | Add-Content $Report
+                    ($_.PathName -notmatch 'Microsoft|Windows|ASUS|Gigabyte|Realtek|Intel|AdGuard|UPSMON|NVIDIA|Armoury|Docker|Steam')
+        } | Select-Object Name, DisplayName, PathName | Format-Table -AutoSize
 
-# Проверка системных файлов
-Add-Content $Report "`n=== Проверка целостности системных файлов (SFC /Scannow) ==="
-sfc /scannow | Out-String | Add-Content $Report
+Write-Host "`n==== Проверка системных файлов и целостности ===="
+sfc /scannow
 
-# Проверка сетевых соединений
-Add-Content $Report "`n=== Текущие сетевые соединения (netstat) ==="
-netstat -ano | Out-String | Add-Content $Report
+Write-Host "`n==== Проверка центра безопасности ===="
+Get-Service | Where-Object { $_.DisplayName -like "*Defender*" -or $_.DisplayName -like "*Security*" } | Format-Table Name, Status, StartType
 
-# Проверка центра безопасности
-Add-Content $Report "`n=== Служба безопасности Windows ==="
-Get-Service | Where-Object { $_.DisplayName -like "*Defender*" -or $_.DisplayName -like "*Security*" } | Out-String | Add-Content $Report
-
-# Финал
-Add-Content $Report "`n=== Проверка завершена успешно ==="
-Write-Host "Отчёт сохранён: $Report"
+Stop-Transcript
+Write-Host "`nОтчёт сохранён на рабочий стол: $Report"
