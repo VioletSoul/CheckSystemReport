@@ -1,5 +1,7 @@
-# filename: SystemAudit_English_Win11_Progress.ps1
-# Purpose: English-only UTF-8 system audit for Windows 11 with robust error handling and console progress.
+# filename: Win11Audit.ps1
+# English-only UTF-8 system audit for Windows 11 with robust error handling
+# Console shows step headers and a single-line progress bar (real-time) for DISM/SFC.
+# Report file contains only clean, readable English output; no raw SFC gibberish.
 
 Set-StrictMode -Version Latest
 
@@ -9,17 +11,25 @@ $desktop   = [Environment]::GetFolderPath('Desktop')
 $Report    = Join-Path $desktop "SystemAudit_$timestamp.txt"
 Set-Content -Path $Report -Value "" -Encoding UTF8
 
-# ==== Progress helpers ====
+# ==== Console progress helpers ====
 function Write-StepStart {
     param([string]$Title)
     $ts = (Get-Date).ToString('u')
     Write-Host ("[{0}] >> {1} ..." -f $ts, $Title)
     Add-Content -Path $Report -Value ("`n=== {0} ===" -f $Title) -Encoding UTF8
 }
+
 function Write-StepDone {
     param([string]$Title)
     $ts = (Get-Date).ToString('u')
-    Write-Host ("[{0}] << {1} done" -f $ts, $Title)
+    # Complete the progress line (if any) and move to a new line
+    Write-Host ("`r[{0}] << {1} done          " -f $ts, $Title)
+}
+
+function Update-ProgressLine {
+    param([string]$Label, [string]$PercentText)
+    # Single carriage return to overwrite the same console line
+    Write-Host -NoNewline ("`r{0}: {1,-6}" -f $Label, $PercentText)
 }
 
 # ==== Report helpers ====
@@ -27,6 +37,7 @@ function Append-Text {
     param([Parameter(Mandatory=$true)][string]$Text)
     Add-Content -Path $Report -Value $Text -Encoding UTF8
 }
+
 function Append-PS {
     param([Parameter(Mandatory=$true)][ScriptBlock]$Cmd, [int]$Width = 600)
     try {
@@ -36,16 +47,85 @@ function Append-PS {
         Append-Text ("ERROR: {0}" -f $_.Exception.Message)
     }
 }
+
 function Append-EXT {
     param([Parameter(Mandatory=$true)][string]$CommandLine, [int]$Width = 600)
     try {
-        # Run external command under cmd in UTF-8 to avoid Cyrillic/OEM mess
+        # Run external command under cmd in UTF-8 to avoid OEM/locale issues
         $output = cmd /c "chcp 65001 > nul & $CommandLine"
         $outStr = ($output | Out-String -Width $Width).TrimEnd()
         if ($outStr) { Append-Text $outStr } else { Append-Text "No data." }
     } catch {
         Append-Text ("ERROR: {0}" -f $_.Exception.Message)
     }
+}
+
+# Run external command with live progress parsing (single-line), return all lines; optionally append tail to report
+function Run-ExternalWithProgress {
+    param(
+        [Parameter(Mandatory=$true)][string]$CommandLine,
+        [Parameter(Mandatory=$true)][string]$Label,
+        [int]$TailToReport = 0
+    )
+    $lines = New-Object System.Collections.Generic.List[string]
+
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = "cmd.exe"
+        $psi.Arguments = "/c chcp 65001 > nul & $CommandLine"
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+        [void]$proc.Start()
+
+        # Read stdout line-by-line, update single-line progress if we spot a percentage
+        while (-not $proc.HasExited) {
+            $line = $proc.StandardOutput.ReadLine()
+            if ($null -ne $line) {
+                $lines.Add($line)
+                # Try to detect percent like "5.9%" or "100%"
+                $m = [regex]::Match($line, '\d{1,3}(\.\d+)?\s*%')
+                if ($m.Success) {
+                    Update-ProgressLine -Label $Label -PercentText $m.Value
+                }
+            } else {
+                Start-Sleep -Milliseconds 50
+            }
+        }
+        # Drain any remaining lines after exit
+        while (-not $proc.StandardOutput.EndOfStream) {
+            $line = $proc.StandardOutput.ReadLine()
+            if ($null -ne $line) {
+                $lines.Add($line)
+                $m = [regex]::Match($line, '\d{1,3}(\.\d+)?\s*%')
+                if ($m.Success) { Update-ProgressLine -Label $Label -PercentText $m.Value }
+            }
+        }
+
+        # Print one last overwrite to clear progress artifacts
+        Update-ProgressLine -Label $Label -PercentText "done"
+        Write-Host ""  # new line
+
+        # Append tail to report if requested (avoid progress bars spam)
+        if ($TailToReport -gt 0) {
+            $tail = $lines | Select-Object -Last $TailToReport
+            if ($tail -and $tail.Count -gt 0) {
+                Append-Text (($tail -join "`r`n"))
+            } else {
+                Append-Text "No data."
+            }
+        }
+    } catch {
+        Append-Text ("ERROR: {0}" -f $_.Exception.Message)
+    } finally {
+        if ($proc -and -not $proc.HasExited) { try { $proc.Kill() } catch {} }
+        if ($proc) { $proc.Dispose() }
+    }
+
+    return $lines.ToArray()
 }
 
 # ==== 0) Elevation info ====
@@ -56,7 +136,7 @@ Append-PS {
 }
 Write-StepDone "Execution Context"
 
-# ==== 1) System information ====
+# ==== 1) System Information ====
 Write-StepStart "System Information"
 Append-PS {
     Get-CimInstance Win32_OperatingSystem | Select-Object `
@@ -78,8 +158,22 @@ Append-PS { Get-CimInstance Win32_PnPSignedDriver | Select-Object DeviceName, Dr
 Write-StepDone "Drivers"
 
 Write-StepStart "Top Processes"
-Append-PS { Get-Process | Sort-Object CPU -Descending | Select-Object -First 25 Name, Id, CPU, WS, PM, StartTime }
-Append-PS { Get-Process | Sort-Object WS -Descending  | Select-Object -First 25 Name, Id, CPU, WS, PM, StartTime }
+# Robust CPU sort (avoid exceptions on missing CPU/StartTime)
+Append-PS {
+    Get-Process | Select-Object Name, Id,
+    @{n='CpuSeconds';e={ if ($_.CPU -ne $null) { [double]$_.CPU } else { 0 } }},
+    @{n='WS';e={$_.WS}},
+    @{n='PM';e={$_.PM}} |
+            Sort-Object CpuSeconds -Descending | Select-Object -First 25
+}
+# Robust WS sort
+Append-PS {
+    Get-Process | Select-Object Name, Id,
+    @{n='CpuSeconds';e={ if ($_.CPU -ne $null) { [double]$_.CPU } else { 0 } }},
+    @{n='WS';e={$_.WS}},
+    @{n='PM';e={$_.PM}} |
+            Sort-Object WS -Descending | Select-Object -First 25
+}
 Write-StepDone "Top Processes"
 
 Write-StepStart "Running Services"
@@ -108,7 +202,7 @@ Append-EXT "netstat -ano | findstr LISTENING"
 Append-EXT "netstat -ano | findstr ESTABLISHED"
 Write-StepDone "TCP Ports and Connections"
 
-# ==== 4) Defender / Security ====
+# ==== 4) Microsoft Defender ====
 Write-StepStart "Microsoft Defender"
 Append-PS {
     Get-Service | Where-Object { $_.Name -like 'WinDefend' -or $_.DisplayName -like '*Defender*' -or $_.DisplayName -like '*Security*' } | Select-Object Name, DisplayName, Status, StartType
@@ -192,13 +286,15 @@ Append-PS {
 }
 Write-StepDone "Scheduled Tasks Summary"
 
-# ==== 7) DISM & SFC (English-only output + CBS summary) ====
+# ==== 7) DISM & SFC (console progress only; report gets clean summary) ====
 Write-StepStart "DISM Health Scan"
-Append-EXT "dism /online /cleanup-image /scanhealth"
+# Show progress in console (single line), append only last 30 lines to report
+[void](Run-ExternalWithProgress -CommandLine "dism /online /cleanup-image /scanhealth" -Label "DISM Health Scan" -TailToReport 30)
 Write-StepDone "DISM Health Scan"
 
 Write-StepStart "SFC Scan"
-Append-EXT "sfc /scannow"
+# Show progress in console (single line), do not append raw output to report
+[void](Run-ExternalWithProgress -CommandLine "sfc /scannow" -Label "SFC Scan" -TailToReport 0)
 Write-StepDone "SFC Scan"
 
 Write-StepStart "SFC English Summary (CBS.log)"
@@ -209,8 +305,9 @@ Append-PS {
             "CBS.log not found at $cbsPath"
             return
         }
-        # CBS.log is typically UTF-16 LE; use Unicode encoding in PS
+        # CBS.log is typically UTF-16 LE; use Unicode encoding in PowerShell
         $lines = Get-Content -Path $cbsPath -Encoding Unicode -ErrorAction Stop
+        # Filter lines mentioning SFC (English tokens present even on localized systems)
         $sfcLines = $lines | Where-Object { $_ -match '\bSFC\b' }
         if ($sfcLines.Count -eq 0) {
             "No SFC entries found in CBS.log."
@@ -266,6 +363,6 @@ Append-PS {
 }
 Write-StepDone "Disk Space Overview"
 
-# Final stamp
+# Final stamp (English-only)
 Append-Text ("`nReport generated at {0} (UTC: {1})" -f (Get-Date).ToString('u'), [DateTime]::UtcNow.ToString('u'))
 Write-Host ("[{0}] >> Report generated: {1}" -f (Get-Date).ToString('u'), $Report)
